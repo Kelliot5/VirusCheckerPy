@@ -1,0 +1,205 @@
+import os
+import hashlib
+import time
+import sys
+import shutil
+import logging
+import requests
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from datetime import datetime
+from threading import Thread
+
+class MalwareScanner(FileSystemEventHandler):
+    def __init__(self, quarantine_dir="quarantine", vt_api_key=None):
+        # Configure logging
+        logging.basicConfig(
+            filename='malware_scan.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+
+        self.vt_api_key = vt_api_key or "YOUR_VIRUSTOTAL_API_KEY"
+        self.quarantine_dir = quarantine_dir
+        os.makedirs(quarantine_dir, exist_ok=True)
+
+        # File type specific extensions to scan
+        self.suspicious_extensions = {'.exe', '.dll', '.bat', '.vbs', '.js', '.ps1'}
+
+        self.scan_results = {
+            "total_files": 0,
+            "malware_found": 0,
+            "files_quarantined": 0,
+            "errors": 0
+        }
+
+        # Local malware signatures (as fallback)
+        self.local_signatures = {
+            "eicar_test": {
+                "md5": "44d88612fea8a8f36de82e1278abb02f",
+                "sha1": "3395856ce81f2b7382dee72602f798b642f14140",
+                "sha256": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+            }
+        }
+
+    def calculate_hashes(self, file_path):
+        """Calculate multiple hashes of a file"""
+        try:
+            with open(file_path, "rb") as file:
+                content = file.read()
+                return {
+                    "md5": hashlib.md5(content).hexdigest(),
+                    "sha1": hashlib.sha1(content).hexdigest(),
+                    "sha256": hashlib.sha256(content).hexdigest()
+                }
+        except (IOError, OSError) as e:
+            self.logger.error(f"Error reading file {file_path}: {str(e)}")
+            self.scan_results["errors"] += 1
+            return None
+
+    def check_virustotal(self, file_hash):
+        """Check file hash against VirusTotal"""
+        if not self.vt_api_key:
+            return None
+        
+        url = "https://www.virustotal.com/api/v3/files/" + file_hash["sha256"]
+        headers = {"x-apikey": self.vt_api_key}
+        
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                result = response.json()
+                stats = result["data"]["attributes"]["last_analysis_stats"]
+                return stats["malicious"] > 0
+        except Exception as e:
+            self.logger.error(f"VirusTotal check failed: {str(e)}")
+        return None
+
+    def basic_behavior_analysis(self, file_path):
+        """Basic behavior analysis based on file attributes"""
+        try:
+            stats = os.stat(file_path)
+            # Suspicious if file was created very recently and has executable permissions
+            recent_creation = (time.time() - stats.st_ctime) < 3600  # 1 hour
+            is_executable = os.access(file_path, os.X_OK)
+            return recent_creation and is_executable
+        except:
+            return False
+
+    def is_malware(self, hashes, file_path):
+        """Check if file is malware using multiple methods"""
+        # Check local signatures
+        for sig in self.local_signatures.values():
+            if (hashes["md5"] == sig["md5"] or 
+                hashes["sha1"] == sig["sha1"] or 
+                hashes["sha256"] == sig["sha256"]):
+                return True
+
+        # Check VirusTotal
+        vt_result = self.check_virustotal(hashes)
+        if vt_result is True:
+            return True
+
+        # Check behavior and file type
+        _, ext = os.path.splitext(file_path)
+        if (ext.lower() in self.suspicious_extensions and 
+            self.basic_behavior_analysis(file_path)):
+            return True
+
+        return False
+
+    def quarantine_file(self, file_path):
+        """Move detected malware to quarantine"""
+        try:
+            dest_path = os.path.join(self.quarantine_dir, 
+                                   f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.path.basename(file_path)}")
+            shutil.move(file_path, dest_path)
+            self.logger.info(f"File quarantined: {file_path} -> {dest_path}")
+            self.scan_results["files_quarantined"] += 1
+            return True
+        except Exception as e:
+            self.logger.error(f"Quarantine failed for {file_path}: {str(e)}")
+            self.scan_results["errors"] += 1
+            return False
+
+    def scan_directory(self, directory):
+        """Scan directory recursively"""
+        self.logger.info(f"Starting scan of {directory}")
+        for root, _, files in os.walk(directory):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                self.scan_results["total_files"] += 1
+
+                hashes = self.calculate_hashes(file_path)
+                if hashes is None:
+                    continue
+
+                if self.is_malware(hashes, file_path):
+                    self.scan_results["malware_found"] += 1
+                    self.logger.warning(f"Malware detected: {file_path}")
+                    self.quarantine_file(file_path)
+
+    def on_any_event(self, event):
+        """Handle real-time monitoring events"""
+        if event.is_directory or event.event_type not in ['created', 'modified']:
+            return
+        
+        file_path = event.src_path
+        hashes = self.calculate_hashes(file_path)
+        if hashes and self.is_malware(hashes, file_path):
+            self.scan_results["malware_found"] += 1
+            self.logger.warning(f"Real-time detection: {file_path}")
+            self.quarantine_file(file_path)
+
+    def start_realtime_monitoring(self, directory):
+        """Start real-time monitoring"""
+        observer = Observer()
+        observer.schedule(self, directory, recursive=True)
+        observer.start()
+        self.logger.info(f"Real-time monitoring started for {directory}")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+        observer.join()
+
+    def print_summary(self):
+        """Print scan summary"""
+        summary = (
+            f"Total files scanned: {self.scan_results['total_files']}\n"
+            f"Malware detected: {self.scan_results['malware_found']}\n"
+            f"Files quarantined: {self.scan_results['files_quarantined']}\n"
+            f"Errors: {self.scan_results['errors']}"
+        )
+        print(summary)
+        self.logger.info("Scan summary:\n" + summary)
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python malware_scanner.py <directory_path> [--realtime]")
+        sys.exit(1)
+
+    directory = sys.argv[1]
+    realtime = "--realtime" in sys.argv
+
+    if not os.path.isdir(directory):
+        print(f"Error: '{directory}' is not a valid directory")
+        sys.exit(1)
+
+    scanner = MalwareScanner()
+    
+    try:
+        if realtime:
+            scanner.scan_directory(directory)  # Initial scan
+            scanner.start_realtime_monitoring(directory)
+        else:
+            scanner.scan_directory(directory)
+            scanner.print_summary()
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        scanner.print_summary()
+
+if __name__ == "__main__":
+    main()
